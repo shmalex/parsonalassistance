@@ -1,0 +1,22 @@
+# Personal Assistant Telegram bot — Python 3.12
+# Telegram
+aiogram==3.15.0
+# OpenAI (GPT chat + Whisper voice transcription)
+openai==1.59.6
+# Database (async Postgres)
+SQLAlchemy[asyncio]==2.0.36
+asyncpg==0.30.0
+# Scheduling (5-minute check-ins)
+APScheduler==3.11.0
+# Config / settings from .env
+# Note: aiogram 3.15 requires pydantic<2.10, so pin below that ceiling.
+pydantic-settings==2.7.1
+pydantic==2.9.2
+# Timezones
+tzdata==2024.2
+# Charts / images (morning dashboard, habit heatmap, countdown calendar)
+matplotlib==3.9.2
+# Google Calendar (read-only). Used only if credentials are present.
+google-api-python-client==2.157.0
+google-auth==2.37.0
+google-auth-oauthlib==1.2.1

@@ -1,0 +1,26 @@
+# Secrets — never commit
+.env
+credentials.json
+token.json
+*.pem
+
+# Personal data dumps / debug captures (contain real Telegram ids, names, chats)
+telegram_details.json
+*.dump.json
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Logs / local data
+logs/
+*.log
+
+# OS
+.DS_Store
