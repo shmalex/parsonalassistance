@@ -167,6 +167,38 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "add_milestone",
+            "description": "Добавить ВЕХУ (конкретный проверяемый шаг) к долгосрочной цели. "
+            "Разбивай большие цели на вехи — прогресс цели считается из выполненных вех. "
+            "Ставь done=true, если человек говорит, что этот шаг УЖЕ сделан.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "goal": {"type": "string", "description": "к какой цели"},
+                    "title": {"type": "string", "description": "шаг/веха"},
+                    "done": {"type": "boolean", "description": "уже выполнено"},
+                },
+                "required": ["goal", "title"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "complete_milestone",
+            "description": "Отметить веху цели выполненной, когда человек сообщает о "
+            "достижении («открыл счёт», «настроил Stripe», «запустил бету»). Прогресс "
+            "цели обновится сам. Если подходящей вехи нет — сперва add_milestone(done=true).",
+            "parameters": {
+                "type": "object",
+                "properties": {"title": {"type": "string"}},
+                "required": ["title"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "add_task",
             "description": "Добавить задачу на сегодня.",
             "parameters": {
@@ -265,6 +297,36 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "reopen_task",
+            "description": "Вернуть задачу в работу (статус todo) — когда человек говорит, "
+            "что задача НЕ сделана, или просит снять отметку «выполнено»/«пропущено» "
+            "(«это ещё не сделано», «не закрывай её», «верни задачу»).",
+            "parameters": {
+                "type": "object",
+                "properties": {"title": {"type": "string"}},
+                "required": ["title"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "rename_task",
+            "description": "Исправить формулировку существующей задачи (ослышался, опечатка, "
+            "уточнение), НЕ создавая новую. Пример: «задача называется не так, должно быть …».",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "old_title": {"type": "string", "description": "текущее (неверное) название"},
+                    "new_title": {"type": "string", "description": "правильное название"},
+                },
+                "required": ["old_title", "new_title"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "set_day_focus",
             "description": "Зафиксировать ОДНУ главную вещь на сегодня (утреннее "
             "обязательство) и при желании короткое намерение. Вызывай, когда человек "
@@ -324,6 +386,17 @@ TOOLS = [
                 "properties": {"theme": {"type": "string"}},
                 "required": ["theme"],
             },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "reflect",
+            "description": "Запустить разбор недели (само-анализ), когда человек просит "
+            "подумать/проанализировать/подвести итоги недели: «вызови рефлексию», "
+            "«подумай, как ты со мной работаешь», «разбери неделю». Бот сам пришлёт "
+            "разбор с кнопкой применить — отдельный текст после этого не нужен.",
+            "parameters": {"type": "object", "properties": {}},
         },
     },
     {
@@ -511,6 +584,32 @@ async def run_tool(user_id: int, name: str, args: dict) -> str:
                 return f"ок: прогресс цели «{title}» — {max(0, min(100, pct))}%" if ok \
                     else f"ошибка: цель «{title}» не найдена"
 
+            if name == "add_milestone":
+                goal_title = (args.get("goal") or "").strip()
+                title = (args.get("title") or "").strip()
+                if not goal_title or not title:
+                    return "ошибка: нужны цель и название вехи"
+                goal = await repo._find_goal_fuzzy(s, user_id, goal_title)
+                if goal is None:
+                    return f"не нашёл цель «{goal_title}»"
+                m = await repo.add_milestone(s, user_id, goal.id, title, done=bool(args.get("done")))
+                pct, dn, tot, gt = await repo._recompute_goal_cache(s, goal.id)
+                await s.commit()
+                if m is None:
+                    return f"веха «{title}» уже есть у «{gt}» ({pct}%, {dn}/{tot})"
+                return f"ок: веха «{title}» добавлена к «{gt}» — {pct}% ({dn}/{tot})"
+
+            if name == "complete_milestone":
+                title = (args.get("title") or "").strip()
+                if not title:
+                    return "ошибка: нужно название вехи"
+                m = await repo.set_milestone_status(s, user_id, title, "done")
+                if m is None:
+                    return f"не нашёл веху «{title}»"
+                pct, dn, tot, gt = await repo._recompute_goal_cache(s, m.goal_id)
+                await s.commit()
+                return f"ок: веха «{m.title}» выполнена — «{gt}» теперь {pct}% ({dn}/{tot})"
+
             if name == "add_task":
                 title = (args.get("title") or "").strip()
                 if not title:
@@ -578,6 +677,25 @@ async def run_tool(user_id: int, name: str, args: dict) -> str:
                     return f"не нашёл открытую задачу «{title}»"
                 word = "выполнена" if new_status == "done" else "пропущена"
                 return f"ок: задача «{matched}» {word}"
+
+            if name == "reopen_task":
+                title = (args.get("title") or "").strip()
+                if not title:
+                    return "ошибка: нужно название задачи"
+                matched = await repo.reopen_task(s, user_id, title)
+                await s.commit()
+                return (f"ок: задача «{matched}» снова в работе (todo)" if matched
+                        else f"не нашёл задачу «{title}»")
+
+            if name == "rename_task":
+                old = (args.get("old_title") or "").strip()
+                new = (args.get("new_title") or "").strip()
+                if not old or not new:
+                    return "ошибка: нужны старое и новое название задачи"
+                matched = await repo.rename_task(s, user_id, old, new)
+                await s.commit()
+                return (f"ок: переименовал задачу в «{matched}»" if matched
+                        else f"не нашёл задачу «{old}»")
 
             if name == "set_week_theme":
                 theme = (args.get("theme") or "").strip()

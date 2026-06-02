@@ -203,6 +203,27 @@ class Goal(Base):
     )
 
 
+class Milestone(Base):
+    """A concrete, checkable step of a goal. Goal progress is DERIVED from these
+    (done / total) — honest, verifiable, not a hand-set vibe number.
+    """
+
+    __tablename__ = "milestones"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    goal_id: Mapped[int] = mapped_column(ForeignKey("goals.id"), index=True)
+    title: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(16), default="todo")  # todo|done
+    position: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
 class Habit(Base):
     """A recurring daily practice the user wants to keep (sport, reading)."""
 

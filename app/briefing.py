@@ -41,9 +41,11 @@ async def gather_dashboard_data(session, user) -> dict:
     goal_rows = []
     for g in goals[:4]:
         days_left = (g.target_date - today).days if g.target_date else None
-        goal_rows.append(
-            {"title": g.title, "progress": g.progress, "days_left": days_left}
-        )
+        pct, done, total = await repo.goal_progress_pct(session, g)
+        goal_rows.append({
+            "title": g.title, "progress": pct, "days_left": days_left,
+            "done": done, "total": total,
+        })
     habit_rows = [
         {
             "title": h.title,
@@ -53,7 +55,11 @@ async def gather_dashboard_data(session, user) -> dict:
         }
         for h in habits[:6]
     ]
-    task_rows = [{"title": t.title, "status": t.status} for t in tasks[:5]]
+    # Show today's open + done tasks; skipped ones are dismissed, don't clutter.
+    task_rows = [
+        {"title": t.title, "status": t.status}
+        for t in tasks if t.status != "skipped"
+    ][:8]
     overdue_rows = [
         {"title": t.title, "date": t.plan_date.strftime("%d.%m")} for t in overdue[:6]
     ]

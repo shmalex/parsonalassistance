@@ -138,7 +138,18 @@ async def _build_context_block(session, user) -> str:
 
     goals = await repo.list_active_goals(session, user.id)
     if goals:
-        parts.append("Активные цели:\n" + "\n".join(f"• {g.title}" for g in goals))
+        gl = []
+        for g in goals:
+            pct, done, total = await repo.goal_progress_pct(session, g)
+            if total:
+                gl.append(f"• {g.title} — {pct}% ({done}/{total} вех):")
+                for m in await repo.list_milestones(session, user.id, g.id):
+                    gl.append(f"    {'✓' if m.status == 'done' else '•'} {m.title}")
+            elif pct is not None:
+                gl.append(f"• {g.title} — {pct}% (вехи не заданы)")
+            else:
+                gl.append(f"• {g.title} (вехи не заданы — предложи разбить на шаги)")
+        parts.append("Активные цели:\n" + "\n".join(gl))
 
     habits = await repo.list_active_habits(session, user.id)
     if habits:
@@ -227,6 +238,10 @@ async def _converse(bot: Bot, message: Message, user_text: str, kind: str,
     )
     await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
 
+    # Track whether a tool already sent its own message (a card / the reflection),
+    # so we can drop the redundant trailing text the user disliked.
+    sent = {"own_message": False, "other_tool": False}
+
     async def _tool_executor(name: str, args: dict) -> str:
         if name == "show_card":
             kind = args.get("kind") or "dashboard"
@@ -237,8 +252,20 @@ async def _converse(bot: Bot, message: Message, user_text: str, kind: str,
             except Exception:  # noqa: BLE001
                 logger.exception("show_card failed")
                 res = "ошибка при отправке карточки"
+            sent["own_message"] = True
+        elif name == "reflect":
+            try:
+                ok = await send_reflection_proposal(message.bot, user)
+                if not ok:
+                    await message.answer(T.REFLECT_NO_DATA)
+                res = "ок: отправил разбор недели" if ok else "данных для разбора пока мало"
+            except Exception:  # noqa: BLE001
+                logger.exception("reflect tool failed")
+                res = "ошибка при разборе недели"
+            sent["own_message"] = True
         else:
             res = await tools.run_tool(user.id, name, args)
+            sent["other_tool"] = True
         logger.info("🛠 ИНСТРУМЕНТ %s(%s) → %s", name, args, res)
         try:
             async with sm() as ev_session:
@@ -260,8 +287,14 @@ async def _converse(bot: Bot, message: Message, user_text: str, kind: str,
         await message.answer(T.ERROR_GENERIC)
         return
 
-    await message.answer(reply)
-    logger.info("🤖 ОТВЕТ  %s[%s]: %s", tg_user.first_name, tg_user.id, _short(reply))
+    # If a tool already sent its own message (card or reflection) and nothing
+    # else happened, skip the trailing filler text ("надеюсь, поможет…").
+    suppress = sent["own_message"] and not sent["other_tool"]
+    if reply and not suppress:
+        await message.answer(reply)
+        logger.info("🤖 ОТВЕТ  %s[%s]: %s", tg_user.first_name, tg_user.id, _short(reply))
+    else:
+        logger.info("🤖 (текст после карточки/разбора подавлен)")
 
     # Passive activity logging only (everything explicit goes via tools).
     signals = await openai_service.extract_signals(user_text)
@@ -789,7 +822,7 @@ async def send_reflection_proposal(bot, user) -> bool:
     return True
 
 
-@router.message(Command("reflect"))
+@router.message(Command("reflect", "reflection"))
 async def cmd_reflect(message: Message) -> None:
     if not _is_allowed(message.from_user.id):
         return

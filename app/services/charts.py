@@ -65,166 +65,176 @@ def _placeholder(text: str) -> bytes:
     return _png(fig)
 
 
+def _clip(text: str, n: int = 46) -> str:
+    text = str(text)
+    return text if len(text) <= n else text[: n - 1] + "…"
+
+
 def render_dashboard(d: dict) -> bytes:
-    """d: {name, date_str, time_str, goals:[{title,progress,days_left}],
-           habits:[{title,target_minutes,schedule_time,done}],
-           tasks:[{title,status}], footer}"""
-    fig = plt.figure(figsize=(8, 10))
+    """Vertically auto-sizing dashboard: the figure grows with the amount of
+    content, so everything fits and there's no big blank space.
+
+    Layout is done in "row units" (≈ one text line); the figure height is set
+    proportional to the total units, and a constant points font keeps spacing
+    even regardless of how many items there are.
+    """
+    LM, RM = 0.06, 0.94
+    UNIT_IN = 0.32          # inches per row unit
+    per_ru = {"day": "сегодня", "week": "за неделю", "month": "за месяц"}
+
+    # ── Pass 1: assemble ordered elements (units, kind, payload) ──────────────
+    E: list[tuple[float, str, object]] = []
+    E.append((1.3, "title", d.get("name", "")))
+    E.append((1.15, "subtitle", (d.get("date_str", ""), d.get("time_str", ""))))
+
+    E.append((1.05, "h2", ("ГЛАВНОЕ СЕГОДНЯ", AMBER)))
+    if d.get("main_thing"):
+        E.append((1.7, "mainbox", d["main_thing"]))
+    else:
+        E.append((0.95, "muted", "Назови ОДНУ главную вещь дня — и я прослежу."))
+
+    E.append((1.15, "h2", ("ЦЕЛИ", ACCENT)))
+    goals = d.get("goals") or []
+    if not goals:
+        E.append((0.95, "muted", "Целей пока нет — назови, к чему идёшь."))
+    for g in goals[:5]:
+        E.append((1.8, "goal", g))
+
+    metrics = d.get("metrics") or []
+    if metrics:
+        E.append((1.15, "h2", ("МЕТРИКИ", ACCENT)))
+        for m in metrics[:6]:
+            if m.get("kind") == "gauge" or not m.get("target"):
+                E.append((1.0, "metric_line", m))
+            else:
+                E.append((1.8, "metric_bar", m))
+
+    E.append((1.15, "h2", ("ПРИВЫЧКИ СЕГОДНЯ", ACCENT)))
+    habits = d.get("habits") or []
+    if not habits:
+        E.append((0.95, "muted", "Привычек нет — добавь спорт, чтение и т.п."))
+    for h in habits[:8]:
+        E.append((1.0, "habit", h))
+
+    E.append((1.15, "h2", ("СЕГОДНЯ ВАЖНО", ACCENT)))
+    tasks = d.get("tasks") or []
+    if tasks:
+        for t in tasks[:8]:
+            E.append((0.95, "task", t))
+    else:
+        E.append((0.95, "muted", "Назови 1–3 приоритета на сегодня — и я прослежу."))
+
+    overdue = d.get("overdue") or []
+    if overdue:
+        E.append((1.15, "h2", ("ХВОСТЫ — НЕ ЗАКРЫТО С ПРОШЛЫХ ДНЕЙ", RED)))
+        for t in overdue[:12]:
+            E.append((0.95, "overdue", t))
+
+    if d.get("footer"):
+        E.append((1.3, "footer", d["footer"]))
+
+    total = sum(u for u, _, _ in E) + 0.6  # +top/bottom padding
+
+    # ── Pass 2: render into an auto-sized figure ──────────────────────────────
+    fig = plt.figure(figsize=(8, max(4.5, total * UNIT_IN)))
     fig.patch.set_facecolor(BG)
     ax = fig.add_axes([0, 0, 1, 1])
     ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
+    ax.set_ylim(0, total)
     ax.axis("off")
-    LM, RM = 0.06, 0.94
 
-    y = 0.96
-    ax.text(LM, y, f"Доброе утро, {d.get('name','')}", color=WHITE,
-            fontsize=24, fontweight="bold", va="top")
-    y -= 0.045
-    ax.text(LM, y, d.get("date_str", ""), color=MUTED, fontsize=13, va="top")
-    ax.text(RM, y, d.get("time_str", ""), color=MUTED, fontsize=13, va="top", ha="right")
-    y -= 0.028
-    ax.plot([LM, RM], [y, y], color=TRACK, lw=1)
-    y -= 0.038
-
-    # The ONE main thing for today — the most prominent block.
-    main_thing = d.get("main_thing")
-    ax.text(LM, y, "ГЛАВНОЕ СЕГОДНЯ", color=AMBER, fontsize=12,
-            fontweight="bold", va="top")
-    y -= 0.04
-    if main_thing:
-        ax.add_patch(Rectangle((LM, y - 0.052), RM - LM, 0.06, color="#1c2230"))
-        ax.text(LM + 0.015, y - 0.022, main_thing, color=WHITE, fontsize=16,
-                fontweight="bold", va="center")
-        y -= 0.085
-    else:
-        ax.text(LM, y, "Назови ОДНУ главную вещь дня — и я прослежу.",
-                color=MUTED, fontsize=12, va="top")
-        y -= 0.05
-
-    # Goals with progress + days left.
-    ax.text(LM, y, "ЦЕЛИ", color=ACCENT, fontsize=12, fontweight="bold", va="top")
-    y -= 0.036
-    goals = d.get("goals") or []
-    if not goals:
-        ax.text(LM, y, "Целей пока нет — назови, к чему идёшь.", color=MUTED,
-                fontsize=12, va="top")
-        y -= 0.04
-    for g in goals[:4]:
-        ax.text(LM, y, g["title"], color=WHITE, fontsize=14, va="top")
-        dl = g.get("days_left")
-        if dl is not None:
-            txt = f"{dl} дн." if dl >= 0 else "просрочено"
-            ax.text(RM, y, txt, color=(RED if dl < 0 else MUTED),
-                    fontsize=12, va="top", ha="right")
-        y -= 0.03
-        bh = 0.018
-        ax.add_patch(Rectangle((LM, y - bh), RM - LM, bh, color=TRACK))
-        p = g.get("progress")
-        if isinstance(p, (int, float)):
-            frac = max(0, min(100, p)) / 100.0
-            ax.add_patch(Rectangle((LM, y - bh), (RM - LM) * frac, bh, color=ACCENT))
-            ax.text(RM, y - bh - 0.006, f"{int(p)}%", color=MUTED,
-                    fontsize=10, va="top", ha="right")
-        y -= 0.052
-
-    # Metrics with progress toward period targets.
-    metrics = d.get("metrics") or []
-    if metrics:
-        y -= 0.012
-        ax.text(LM, y, "МЕТРИКИ", color=ACCENT, fontsize=12, fontweight="bold", va="top")
-        y -= 0.036
-        per_ru = {"day": "сегодня", "week": "за неделю", "month": "за месяц"}
-        for m in metrics[:5]:
+    y = total - 0.3  # cursor = top of the current element's band
+    for units, kind, payload in E:
+        if kind == "title":
+            ax.text(LM, y, f"Доброе утро, {payload}", color=WHITE,
+                    fontsize=22, fontweight="bold", va="top")
+        elif kind == "subtitle":
+            ds, ts = payload
+            ax.text(LM, y - 0.1, ds, color=MUTED, fontsize=12, va="top")
+            ax.text(RM, y - 0.1, ts, color=MUTED, fontsize=12, va="top", ha="right")
+            ax.plot([LM, RM], [y - 0.85, y - 0.85], color=TRACK, lw=1)
+        elif kind == "h2":
+            txt, col = payload
+            ax.text(LM, y - 0.28, txt, color=col, fontsize=12,
+                    fontweight="bold", va="top")
+        elif kind == "muted":
+            ax.text(LM, y - 0.15, payload, color=MUTED, fontsize=12, va="top")
+        elif kind == "mainbox":
+            ax.add_patch(Rectangle((LM, y - 1.5), RM - LM, 1.28, color="#1c2230"))
+            ax.text(LM + 0.015, y - 0.86, _clip(payload, 52), color=WHITE,
+                    fontsize=15, fontweight="bold", va="center")
+        elif kind == "goal":
+            g = payload
+            ax.text(LM, y - 0.1, _clip(g["title"]), color=WHITE, fontsize=14, va="top")
+            dl = g.get("days_left")
+            if dl is not None:
+                ax.text(RM, y - 0.1, (f"{dl} дн." if dl >= 0 else "просрочено"),
+                        color=(RED if dl < 0 else MUTED), fontsize=12, va="top", ha="right")
+            ax.add_patch(Rectangle((LM, y - 1.3), RM - LM, 0.34, color=TRACK))
+            p = g.get("progress")
+            if isinstance(p, (int, float)):
+                frac = max(0, min(100, p)) / 100.0
+                ax.add_patch(Rectangle((LM, y - 1.3), (RM - LM) * frac, 0.34, color=ACCENT))
+                tot = g.get("total") or 0
+                label = f"{int(p)}% · {g.get('done', 0)}/{tot} вех" if tot else f"{int(p)}%"
+                ax.text(RM, y - 1.42, label, color=MUTED, fontsize=10,
+                        va="top", ha="right")
+            elif not g.get("total"):
+                ax.text(RM, y - 1.42, "разбей на вехи", color=MUTED, fontsize=10,
+                        va="top", ha="right")
+        elif kind == "metric_line":
+            m = payload
             unit = (" " + m["unit"]) if m.get("unit") else ""
             if m.get("kind") == "gauge":
                 val = m.get("latest")
                 txt = f"{m['title']}: {_n(val)}{unit}" if val is not None else f"{m['title']}: —"
-                ax.text(LM, y, txt, color=WHITE, fontsize=14, va="top")
-                y -= 0.038
-                continue
-            ax.text(LM, y, m["title"], color=WHITE, fontsize=14, va="top")
-            if m.get("target"):
-                ax.text(RM, y, f"{_n(m['period_sum'])}/{_n(m['target'])}{unit}",
-                        color=MUTED, fontsize=12, va="top", ha="right")
-                y -= 0.03
-                bh = 0.018
-                ax.add_patch(Rectangle((LM, y - bh), RM - LM, bh, color=TRACK))
-                frac = max(0.0, min(1.0, m["period_sum"] / m["target"])) if m["target"] else 0
-                ax.add_patch(Rectangle((LM, y - bh), (RM - LM) * frac, bh, color=GREEN))
-                ax.text(RM, y - bh - 0.006,
-                        f"{m.get('pct', 0)}% · прогноз ~{_n(m['projected'])}",
-                        color=MUTED, fontsize=10, va="top", ha="right")
-                y -= 0.052
             else:
-                ax.text(RM, y, f"{_n(m['period_sum'])}{unit} {per_ru.get(m['period'], '')}",
-                        color=MUTED, fontsize=12, va="top", ha="right")
-                y -= 0.04
-
-    y -= 0.012
-    # Habits today.
-    ax.text(LM, y, "ПРИВЫЧКИ СЕГОДНЯ", color=ACCENT, fontsize=12,
-            fontweight="bold", va="top")
-    y -= 0.036
-    habits = d.get("habits") or []
-    if not habits:
-        ax.text(LM, y, "Привычек нет — добавь спорт, чтение и т.п.", color=MUTED,
-                fontsize=12, va="top")
-        y -= 0.04
-    for h in habits[:6]:
-        sq = 0.024
-        col = GREEN if h.get("done") else TRACK
-        ax.add_patch(Rectangle((LM, y - sq), sq, sq, color=col, ec="#3b4a63", lw=1))
-        if h.get("done"):
-            cx, cy = LM + sq / 2, y - sq / 2
-            ax.plot([cx - 0.007, cx - 0.001, cx + 0.009],
-                    [cy, cy - 0.006, cy + 0.008], color="#06240f", lw=2)
-        label = h["title"]
-        meta = []
-        if h.get("target_minutes"):
-            meta.append(f"{h['target_minutes']} мин")
-        if h.get("schedule_time"):
-            meta.append(h["schedule_time"])
-        if meta:
-            label += f"  ({', '.join(meta)})"
-        ax.text(LM + sq + 0.02, y - sq + 0.002, label,
-                color=(MUTED if h.get("done") else WHITE), fontsize=13, va="bottom")
-        y -= 0.042
-
-    y -= 0.012
-    # Today's priorities.
-    ax.text(LM, y, "СЕГОДНЯ ВАЖНО", color=ACCENT, fontsize=12,
-            fontweight="bold", va="top")
-    y -= 0.036
-    tasks = d.get("tasks") or []
-    if tasks:
-        for t in tasks[:5]:
+                txt = (f"{m['title']}: {_n(m['period_sum'])}{unit} "
+                       f"{per_ru.get(m['period'], '')}".rstrip())
+            ax.text(LM, y - 0.1, _clip(txt, 52), color=WHITE, fontsize=14, va="top")
+        elif kind == "metric_bar":
+            m = payload
+            unit = (" " + m["unit"]) if m.get("unit") else ""
+            ax.text(LM, y - 0.1, _clip(m["title"]), color=WHITE, fontsize=14, va="top")
+            ax.text(RM, y - 0.1, f"{_n(m['period_sum'])}/{_n(m['target'])}{unit}",
+                    color=MUTED, fontsize=12, va="top", ha="right")
+            ax.add_patch(Rectangle((LM, y - 1.3), RM - LM, 0.34, color=TRACK))
+            frac = max(0.0, min(1.0, m["period_sum"] / m["target"])) if m.get("target") else 0
+            ax.add_patch(Rectangle((LM, y - 1.3), (RM - LM) * frac, 0.34, color=GREEN))
+            ax.text(RM, y - 1.42, f"{m.get('pct', 0)}% · прогноз ~{_n(m['projected'])}",
+                    color=MUTED, fontsize=10, va="top", ha="right")
+        elif kind == "habit":
+            h = payload
+            done = h.get("done")
+            ax.text(LM, y - 0.12, "●" if done else "○",
+                    color=(GREEN if done else MUTED), fontsize=13, va="top")
+            label = h["title"]
+            meta = []
+            if h.get("target_minutes"):
+                meta.append(f"{h['target_minutes']} мин")
+            if h.get("schedule_time"):
+                meta.append(h["schedule_time"])
+            if meta:
+                label += f"  ({', '.join(meta)})"
+            ax.text(LM + 0.035, y - 0.12, _clip(label, 50),
+                    color=(MUTED if done else WHITE), fontsize=13, va="top")
+        elif kind == "task":
+            t = payload
             done = t.get("status") == "done"
             mark = "✓" if done else "•"
-            ax.text(LM, y, f"{mark}  {t['title']}",
+            ax.text(LM, y - 0.1, f"{mark}  {_clip(t['title'])}",
                     color=(MUTED if done else WHITE), fontsize=13, va="top")
-            y -= 0.034
-    else:
-        ax.text(LM, y, "Назови 1–3 приоритета на сегодня — и я прослежу.",
-                color=MUTED, fontsize=12, va="top")
-        y -= 0.034
+        elif kind == "overdue":
+            t = payload
+            ax.text(LM, y - 0.1, f"• {_clip(t['title'], 40)}", color=WHITE,
+                    fontsize=13, va="top")
+            ax.text(RM, y - 0.1, f"от {t.get('date', '')}", color=RED,
+                    fontsize=11, va="top", ha="right")
+        elif kind == "footer":
+            ax.text(LM, y - 0.15, payload, color=MUTED, fontsize=11,
+                    va="top", style="italic")
+        y -= units
 
-    # Carried-over unfinished tasks from earlier days — honest backlog.
-    overdue = d.get("overdue") or []
-    if overdue:
-        y -= 0.014
-        ax.text(LM, y, "ХВОСТЫ — НЕ ЗАКРЫТО С ПРОШЛЫХ ДНЕЙ", color=RED,
-                fontsize=12, fontweight="bold", va="top")
-        y -= 0.036
-        for t in overdue[:6]:
-            ax.text(LM, y, f"• {t['title']}", color=WHITE, fontsize=13, va="top")
-            ax.text(RM, y, f"от {t.get('date', '')}", color=RED, fontsize=11,
-                    va="top", ha="right")
-            y -= 0.034
-
-    footer = d.get("footer")
-    if footer:
-        ax.text(LM, 0.035, footer, color=MUTED, fontsize=11, va="bottom", style="italic")
     return _png(fig)
 
 

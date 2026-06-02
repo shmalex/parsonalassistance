@@ -39,6 +39,7 @@ from app.db.models import (  # noqa: E402
     Message,
     Metric,
     MetricEntry,
+    Milestone,
     Mood,
     Nudge,
     Profile,
@@ -349,23 +350,53 @@ async def open_tasks_before(
     return list(res.scalars().all())
 
 
-async def set_task_status(
-    session: AsyncSession, user_id: int, title: str, status: str
-) -> str | None:
-    """Change status of the best-matching OPEN task (any day). Returns its title."""
-    res = await session.execute(
-        select(Task).where(
-            Task.user_id == user_id, Task.status.in_(("todo", "doing"))
-        )
-    )
+async def _find_task_fuzzy(
+    session: AsyncSession, user_id: int, title: str, statuses: tuple[str, ...] | None
+) -> Task | None:
+    stmt = select(Task).where(Task.user_id == user_id)
+    if statuses:
+        stmt = stmt.where(Task.status.in_(statuses))
+    res = await session.execute(stmt)
     best, best_score = None, 0.0
     for t in res.scalars().all():
         sc = _similar(t.title, title)
         if sc > best_score:
             best, best_score = t, sc
-    if best is not None and best_score >= 0.6:
-        best.status = status
-        return best.title
+    return best if best is not None and best_score >= 0.6 else None
+
+
+async def set_task_status(
+    session: AsyncSession, user_id: int, title: str, status: str
+) -> str | None:
+    """Change status of the best-matching OPEN task (any day). Returns its title."""
+    t = await _find_task_fuzzy(session, user_id, title, ("todo", "doing"))
+    if t is not None:
+        t.status = status
+        return t.title
+    return None
+
+
+async def reopen_task(session: AsyncSession, user_id: int, title: str) -> str | None:
+    """Put a task back to 'todo' (undo a wrong/early completion)."""
+    t = await _find_task_fuzzy(session, user_id, title, ("done", "skipped"))
+    if t is None:  # fall back to any status (idempotent)
+        t = await _find_task_fuzzy(session, user_id, title, None)
+    if t is not None:
+        t.status = "todo"
+        return t.title
+    return None
+
+
+async def rename_task(
+    session: AsyncSession, user_id: int, old_title: str, new_title: str
+) -> str | None:
+    """Fix a task's wording (e.g. mis-transcription). Returns the NEW title."""
+    t = await _find_task_fuzzy(session, user_id, old_title, ("todo", "doing"))
+    if t is None:
+        t = await _find_task_fuzzy(session, user_id, old_title, None)
+    if t is not None:
+        t.title = new_title.strip()
+        return t.title
     return None
 
 
@@ -579,6 +610,89 @@ async def set_goal_progress(
         goal.progress = max(0, min(100, percent))
         return True
     return False
+
+
+# ─── Milestones (honest, derived goal progress) ──────────────────────────────
+async def list_milestones(
+    session: AsyncSession, user_id: int, goal_id: int
+) -> list[Milestone]:
+    res = await session.execute(
+        select(Milestone)
+        .where(Milestone.user_id == user_id, Milestone.goal_id == goal_id)
+        .order_by(Milestone.position, Milestone.id)
+    )
+    return list(res.scalars().all())
+
+
+def _milestone_stats(milestones: list[Milestone]) -> tuple[int, int]:
+    done = sum(1 for m in milestones if m.status == "done")
+    return done, len(milestones)
+
+
+async def goal_progress_pct(
+    session: AsyncSession, goal: Goal
+) -> tuple[int | None, int, int]:
+    """Derived progress from milestones (done/total). Falls back to the manual
+    `goal.progress` only when there are no milestones. Returns (pct, done, total)."""
+    ms = await list_milestones(session, goal.user_id, goal.id)
+    done, total = _milestone_stats(ms)
+    if total > 0:
+        return round(done / total * 100), done, total
+    return goal.progress, 0, 0
+
+
+async def _recompute_goal_cache(session: AsyncSession, goal_id: int) -> tuple[int, int, int, str]:
+    """Recompute and cache goal.progress from milestones. Returns (pct,done,total,title)."""
+    goal = await session.get(Goal, goal_id)
+    if goal is None:
+        return 0, 0, 0, ""
+    ms = await list_milestones(session, goal.user_id, goal_id)
+    done, total = _milestone_stats(ms)
+    pct = round(done / total * 100) if total else (goal.progress or 0)
+    if total:
+        goal.progress = pct
+    return pct, done, total, goal.title
+
+
+async def add_milestone(
+    session: AsyncSession, user_id: int, goal_id: int, title: str, done: bool = False
+) -> Milestone | None:
+    """Add a step to a goal, unless a similar one already exists (fuzzy)."""
+    existing = await list_milestones(session, user_id, goal_id)
+    for m in existing:
+        if _similar(m.title, title) >= 0.8:
+            return None
+    ms = Milestone(
+        user_id=user_id, goal_id=goal_id, title=title.strip(),
+        status="done" if done else "todo", position=len(existing),
+    )
+    session.add(ms)
+    await session.flush()
+    return ms
+
+
+async def find_milestone_fuzzy(
+    session: AsyncSession, user_id: int, title: str
+) -> Milestone | None:
+    res = await session.execute(
+        select(Milestone).where(Milestone.user_id == user_id)
+    )
+    best, best_score = None, 0.0
+    for m in res.scalars().all():
+        sc = _similar(m.title, title)
+        if sc > best_score:
+            best, best_score = m, sc
+    return best if best is not None and best_score >= 0.6 else None
+
+
+async def set_milestone_status(
+    session: AsyncSession, user_id: int, title: str, status: str
+) -> Milestone | None:
+    m = await find_milestone_fuzzy(session, user_id, title)
+    if m is not None:
+        m.status = status
+        return m
+    return None
 
 
 # ─── Habits ──────────────────────────────────────────────────────────────────
