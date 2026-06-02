@@ -10,6 +10,10 @@ and (optionally) reads Google Calendar.
 > **Architecture diagrams:** `docs/architecture.md` (Russian, Mermaid) — module
 > map, message-processing sequence, proactive-tick decision, ER model, state
 > diagrams. Update it when modules/tables change.
+> **Narrative vision (non-technical):** `docs/thinking-bot.md` (Russian) — the
+> "bot that thinks" story: bot's own task-journal (snooze-until-morning), an
+> affordable cheap-model "inner voice" for judgment, strong model for speaking,
+> hard facts computed in code (think vs compute) — "care but verify".
 
 ## Core product principle (the "nanny")
 The bot is a **nanny**: it **cares, but verifies** (доверяй, но проверяй), and the
