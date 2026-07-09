@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from app import repository as repo
-from app.services import openai_service
+from app.services import openai_service, usage
 
 
 def _today(tz_name: str):
@@ -92,7 +92,8 @@ async def run_reflection(session, user):
     if not has_enough_data(stats):
         return None
     prof = await repo.get_or_create_profile(session, user.id)
-    result = await openai_service.reflect(evidence, prof.playbook, prof.week_theme)
+    with usage.attribute(user.id):
+        result = await openai_service.reflect(evidence, prof.playbook, prof.week_theme)
     if not result:
         return None
     refl = await repo.add_reflection(

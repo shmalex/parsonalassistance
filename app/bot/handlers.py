@@ -5,7 +5,9 @@ import asyncio
 import io
 import json
 import logging
+import re
 from datetime import datetime, timedelta
+from datetime import timezone as dt_timezone
 from zoneinfo import ZoneInfo
 
 from aiogram import BaseMiddleware, Bot, F, Router
@@ -25,10 +27,22 @@ from app import repository as repo
 from app.bot import text as T
 from app.config import get_settings
 from app.db.session import get_sessionmaker
-from app.services import calendar_service, charts, openai_service, tools
+from app.services import calendar_service, charts, openai_service, tools, usage
 
 logger = logging.getLogger(__name__)
 router = Router()
+
+# A user message counts as the answer to a check-in only within this window.
+CHECKIN_ANSWER_WINDOW_MIN = 90
+
+# Reply phrases that promise a future ping. If the model says one of these
+# without calling remind_once, the promise would silently never fire — the
+# single biggest trust-killer found in the June dialog audit.
+_PROMISE_RE = re.compile(
+    r"\bнапомню\b|\bнапишу\s+(?:тебе\s+)?(?:позже|вечером|завтра|через)"
+    r"|\bвернусь\s+к\s+(?:этому|тебе)|\bспрошу\s+(?:тебя\s+)?(?:позже|вечером|завтра)",
+    re.IGNORECASE,
+)
 
 
 def _short(text: str | None, limit: int = 800) -> str:
@@ -62,6 +76,33 @@ class IncomingLogMiddleware(BaseMiddleware):
 
 
 router.message.outer_middleware(IncomingLogMiddleware())
+
+
+class UsageAttributionMiddleware(BaseMiddleware):
+    """Set the current user so OpenAI usage (tokens/cost) is attributed to them.
+
+    Registered as an OUTER middleware so the contextvar is set before any handler
+    logic runs; it is always reset in ``finally`` (contextvars are per-task and
+    aiogram may reuse tasks, so resetting is mandatory to avoid leaking).
+    """
+
+    async def __call__(self, handler, event, data):
+        token = None
+        try:
+            tg_user = getattr(event, "from_user", None)
+            if tg_user is not None:
+                token = usage.set_user(tg_user.id)
+        except Exception:  # noqa: BLE001 — attribution must never break handling
+            token = None
+        try:
+            return await handler(event, data)
+        finally:
+            if token is not None:
+                usage.reset_user(token)
+
+
+router.message.outer_middleware(UsageAttributionMiddleware())
+router.callback_query.outer_middleware(UsageAttributionMiddleware())
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -175,6 +216,21 @@ async def _build_context_block(session, user) -> str:
             )
         )
 
+    # The bot's own promises — so it knows what it already committed to
+    # ("ну что там?" must never get "напомни, про что ты").
+    commitments = await repo.pending_commitments(session, user.id)
+    if commitments:
+        tz = ZoneInfo(user.timezone)
+        lines = [
+            f"• {c.due_at.astimezone(tz).strftime('%d.%m %H:%M')} — {c.text}"
+            for c in commitments
+        ]
+        parts.append(
+            "Твои активные обещания-напоминания (они сработают сами, не обещай "
+            "повторно; если человек спрашивает «что там» — ответ здесь):\n"
+            + "\n".join(lines)
+        )
+
     # Calendar is read-only and sync; run it off the event loop.
     events = await asyncio.get_running_loop().run_in_executor(
         None, calendar_service.get_events_for_day, today, user.timezone
@@ -220,8 +276,15 @@ async def _converse(bot: Bot, message: Message, user_text: str, kind: str,
             voice_file_id=voice_file_id, transcription=transcription,
         )
 
-        # If the bot recently asked a check-in, treat this as the answer.
-        pending = await repo.latest_unanswered_checkin(session, user.id)
+        # If the bot RECENTLY asked a check-in, treat this as the answer. The
+        # window matters: without it a fresh message "answered" a days-old
+        # check-in, inflating answer stats and hiding real silence.
+        cutoff = datetime.now(dt_timezone.utc) - timedelta(
+            minutes=CHECKIN_ANSWER_WINDOW_MIN
+        )
+        pending = await repo.latest_unanswered_checkin(
+            session, user.id, asked_after=cutoff
+        )
         if pending is not None:
             await repo.answer_checkin(session, pending, user_text)
             logger.info("✅ ЗАЧТЕНО как ответ на проверку #%s", pending.id)
@@ -241,8 +304,10 @@ async def _converse(bot: Bot, message: Message, user_text: str, kind: str,
     # Track whether a tool already sent its own message (a card / the reflection),
     # so we can drop the redundant trailing text the user disliked.
     sent = {"own_message": False, "other_tool": False}
+    called_tools: set[str] = set()
 
     async def _tool_executor(name: str, args: dict) -> str:
+        called_tools.add(name)
         if name == "show_card":
             kind = args.get("kind") or "dashboard"
             try:
@@ -286,6 +351,36 @@ async def _converse(bot: Bot, message: Message, user_text: str, kind: str,
         logger.exception("mentor_reply failed")
         await message.answer(T.ERROR_GENERIC)
         return
+
+    # «Сказал = сделал»: a reply that promises a future ping without putting it
+    # into the commitments journal would silently break the promise. One
+    # corrective round: make the model either call remind_once or drop the
+    # promise. Never loops (single retry, best-effort).
+    if reply and _PROMISE_RE.search(reply) and "remind_once" not in called_tools:
+        logger.warning("⚠️ обещание без remind_once — корректирующий раунд")
+        try:
+            fixed = await openai_service.mentor_reply_with_tools(
+                [
+                    *history,
+                    {"role": "assistant", "content": reply},
+                    {
+                        "role": "system",
+                        "content": (
+                            "Ты только что пообещал напомнить/вернуться к теме, но НЕ "
+                            "вызвал инструмент remind_once — значит, напоминание не "
+                            "придёт и обещание будет нарушено. Сейчас же вызови "
+                            "remind_once с текстом и временем напоминания, а затем "
+                            "коротко подтверди. Если время неясно или напоминание не "
+                            "нужно — переформулируй ответ БЕЗ обещания напомнить."
+                        ),
+                    },
+                ],
+                context_block, _tool_executor, max_rounds=2,
+            )
+            if fixed:
+                reply = fixed
+        except Exception:  # noqa: BLE001 — keep the original reply on failure
+            logger.exception("promise-enforcement round failed")
 
     # If a tool already sent its own message (card or reflection) and nothing
     # else happened, skip the trailing filler text ("надеюсь, поможет…").
@@ -861,19 +956,120 @@ async def on_reflect(cb: CallbackQuery) -> None:
     await cb.message.answer(T.REFLECT_APPLIED.format(theme=theme))
 
 
+# ─── Cost / usage ────────────────────────────────────────────────────────────
+def _fmt_usd(x: float) -> str:
+    return f"${x:,.2f}" if x >= 1 else f"${x:.4f}"
+
+
+def _fmt_tokens(n: int) -> str:
+    return f"{int(n):,}"  # full number with thousands separator, e.g. 8,742
+
+
+def _cost_viewers() -> set[int]:
+    """Telegram ids that may see the GLOBAL (all-users) spend + per-user names:
+    the OWNER plus any explicit non-owner COST_VIEWER_IDS.
+
+    When neither is set, only a SINGLE-user allowlist auto-grants that lone user
+    (no one else's data exists to leak); a multi-user allowlist shows the global
+    section to nobody until an owner/viewer is configured.
+    """
+    s = get_settings()
+    viewers = set(s.cost_viewers)
+    if viewers:
+        return viewers
+    allowed = s.allowed_ids
+    return {next(iter(allowed))} if len(allowed) == 1 else set()
+
+
+@router.message(Command("cost"))
+async def cmd_cost(message: Message) -> None:
+    if not _is_allowed(message.from_user.id):
+        await message.answer(T.NOT_ALLOWED)
+        return
+    sm = get_sessionmaker()
+    async with sm() as session:
+        user = await repo.get_or_create_user(session, message.from_user)
+        tz = user.timezone
+        await session.commit()
+
+    now_local = datetime.now(ZoneInfo(tz))
+    today_start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    windows = [
+        ("Сегодня", today_start),
+        ("7 дней", now_local - timedelta(days=7)),
+        ("Всё время", None),
+    ]
+
+    lines = ["💰 Расходы OpenAI (мои)"]
+    async with sm() as session:
+        for label, since in windows:
+            total = await repo.usage_total(session, user_id=user.id, since=since)
+            lines.append("")
+            lines.append(
+                f"{label}: {_fmt_usd(total['cost'])} · "
+                f"{_fmt_tokens(total['total'])} ток · {total['calls']} выз"
+            )
+            for r in await repo.usage_grouped(
+                session, user_id=user.id, since=since, by="model"
+            ):
+                extra = f", {r['audio'] / 60:.1f} мин" if r["audio"] else ""
+                lines.append(
+                    f"  {r['key']}: {_fmt_usd(r['cost'])} "
+                    f"({_fmt_tokens(r['total'])}{extra})"
+                )
+
+        if message.from_user.id in _cost_viewers():
+            lines.append("")
+            lines.append("── 🌍 Всего по всем пользователям ──")
+            for label, since in windows:
+                total = await repo.usage_total(session, user_id=None, since=since)
+                lines.append(
+                    f"{label}: {_fmt_usd(total['cost'])} · "
+                    f"{_fmt_tokens(total['total'])} ток · {total['calls']} выз"
+                )
+            by_user = await repo.usage_by_user(session, since=None)
+            if by_user:
+                lines.append("")
+                lines.append("По людям (всё время):")
+                for u in by_user:
+                    if u["uid"] is None:
+                        who = "без пользователя"
+                    else:
+                        who = (
+                            u["name"]
+                            or (f"@{u['username']}" if u["username"] else f"id{u['uid']}")
+                        )
+                    lines.append(
+                        f"  {who}: {_fmt_usd(u['cost'])} ({_fmt_tokens(u['total'])})"
+                    )
+        await session.commit()
+    await message.answer("\n".join(lines))
+
+
 # ─── Voice / audio ───────────────────────────────────────────────────────────
-async def _handle_audio(message: Message, file_id: str) -> None:
+async def _handle_audio(
+    message: Message, file_id: str, audio_seconds: int | None = None
+) -> None:
     """Download an audio-bearing message, transcribe it and converse."""
     if not _is_allowed(message.from_user.id):
         await message.answer(T.NOT_ALLOWED)
         return
+    # Ensure the user row exists BEFORE the first metered call (transcription):
+    # the voice path transcribes before _converse runs, so without this a brand-new
+    # user's first voice note would lose its usage row to a FK violation.
+    sm = get_sessionmaker()
+    async with sm() as session:
+        await repo.get_or_create_user(session, message.from_user)
+        await session.commit()
     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
     try:
         tg_file = await message.bot.get_file(file_id)
         buf = io.BytesIO()
         await message.bot.download_file(tg_file.file_path, buf)
         audio = buf.getvalue()
-        transcription = await openai_service.transcribe_voice(audio)
+        transcription = await openai_service.transcribe_voice(
+            audio, audio_seconds=audio_seconds
+        )
     except Exception:  # noqa: BLE001
         logger.exception("voice transcription failed")
         await message.answer(T.ERROR_GENERIC)
@@ -893,7 +1089,9 @@ async def _handle_audio(message: Message, file_id: str) -> None:
 @router.message(F.voice | F.audio | F.video_note)
 async def on_audio(message: Message) -> None:
     media = message.voice or message.audio or message.video_note
-    await _handle_audio(message, media.file_id)
+    await _handle_audio(
+        message, media.file_id, audio_seconds=getattr(media, "duration", None)
+    )
 
 
 @router.message(F.document)

@@ -16,6 +16,7 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     Integer,
+    Numeric,
     String,
     Text,
     func,
@@ -365,6 +366,75 @@ class ToolEvent(Base):
     result: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), index=True
+    )
+
+
+class OpenAIUsage(Base):
+    """Append-only per-call OpenAI token + cost accounting. One row per API call.
+
+    Stores the raw token counts AND the computed USD cost (plus the
+    ``price_version`` that produced it), so spend is queryable now and
+    recomputable later if prices change — without re-calling OpenAI.
+    """
+
+    __tablename__ = "openai_usage"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    # Nullable: a call with no user context (e.g. a future cron) is still recorded.
+    user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id"), nullable=True, index=True
+    )
+    # Semantic call label: mentor_chat | mentor_chat_final | checkin | habit_nudge
+    # | review | summary | reflection | extraction | transcribe
+    purpose: Mapped[str] = mapped_column(String(32), index=True)
+    # The exact model string actually sent (so historical rows stay truthful).
+    model: Mapped[str] = mapped_column(String(64), index=True)
+    api: Mapped[str] = mapped_column(String(16), default="chat")  # chat|transcription
+    prompt_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    completion_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    total_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    # Cached prompt tokens (subset of prompt_tokens) — billed cheaper.
+    cached_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    # Whisper only — audio length; NULL for chat calls.
+    audio_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # NUMERIC (not float) so summing thousands of sub-cent rows stays exact.
+    cost_usd: Mapped[float] = mapped_column(Numeric(12, 8), default=0)
+    price_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # False when the API call raised (recorded with zero usage for visibility).
+    ok: Mapped[bool] = mapped_column(Boolean, default=True)
+    error: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # For the mentor tool-loop: which round produced this row (1..N), else NULL.
+    rounds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+
+
+class BotCommitment(Base):
+    """A promise the bot itself made («напомню в 18:30», «вернусь к этому завтра»).
+
+    The trust-critical rule: the bot may only promise what lands here, and
+    everything here MUST fire. The scheduler executes due commitments with top
+    priority; they bypass the silence governor and active hours (the user asked
+    for them explicitly). "Removing" one is a status change, never a delete.
+    """
+
+    __tablename__ = "bot_commitments"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    # What to say when it fires (the reminder/follow-up text, user-facing).
+    text: Mapped[str] = mapped_column(Text)
+    # "reminder" (user asked) | "followup" (bot promised to return to a topic)
+    kind: Mapped[str] = mapped_column(String(16), default="reminder")
+    due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    # "pending" | "sent" | "cancelled"
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    sent_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
     )
 
 

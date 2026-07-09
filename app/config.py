@@ -31,6 +31,13 @@ class Settings(BaseSettings):
     telegram_bot_token: str = Field(default="")
     # Comma-separated numeric ids; empty = allow everyone.
     allowed_telegram_ids: str = Field(default="")
+    # The bot's OWNER (operator). The owner may always see GLOBAL (all-users)
+    # /cost spend. When unset, only a single-user allowlist auto-grants that lone
+    # user (a multi-user allowlist needs an owner/viewer set explicitly).
+    owner_telegram_id: int | None = Field(default=None)
+    # Additional NON-owner Telegram ids (comma-separated) allowed to VIEW global
+    # /cost spend — e.g. a trusted helper. They can see costs but aren't owners.
+    cost_viewer_ids: str = Field(default="")
 
     # ─── OpenAI ──────────────────────────────────────────────────────────────
     openai_api_key: str = Field(default="")
@@ -74,6 +81,22 @@ class Settings(BaseSettings):
     def allowed_ids(self) -> set[int]:
         out: set[int] = set()
         for part in self.allowed_telegram_ids.split(","):
+            part = part.strip()
+            if part:
+                try:
+                    out.add(int(part))
+                except ValueError:
+                    pass
+        return out
+
+    @property
+    def cost_viewers(self) -> set[int]:
+        """Telegram ids allowed to see GLOBAL /cost: the owner + any explicit
+        non-owner viewers."""
+        out: set[int] = set()
+        if self.owner_telegram_id:
+            out.add(self.owner_telegram_id)
+        for part in self.cost_viewer_ids.split(","):
             part = part.strip()
             if part:
                 try:

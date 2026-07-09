@@ -14,6 +14,10 @@ and (optionally) reads Google Calendar.
 > "bot that thinks" story: bot's own task-journal (snooze-until-morning), an
 > affordable cheap-model "inner voice" for judgment, strong model for speaking,
 > hard facts computed in code (think vs compute) — "care but verify".
+> **Engagement plan (to build):** `docs/engagement.md` (Russian) — engagement
+> engine: per-user engagement timeline (long history, not 20 msgs) → strategist
+> picks a re-engagement tactic or silence → learns what works. Start with the
+> timeline. Goal = genuine replies/the user's benefit, never message volume.
 
 ## Core product principle (the "nanny")
 The bot is a **nanny**: it **cares, but verifies** (доверяй, но проверяй), and the

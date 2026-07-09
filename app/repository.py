@@ -31,6 +31,7 @@ def _similar(a: str, b: str) -> float:
 
 from app.db.models import (  # noqa: E402
     Activity,
+    BotCommitment,
     CheckIn,
     DayLog,
     Goal,
@@ -42,6 +43,7 @@ from app.db.models import (  # noqa: E402
     Milestone,
     Mood,
     Nudge,
+    OpenAIUsage,
     Profile,
     Reflection,
     Task,
@@ -136,20 +138,57 @@ async def create_checkin(session: AsyncSession, user_id: int, question: str) -> 
 
 
 async def latest_unanswered_checkin(
-    session: AsyncSession, user_id: int
+    session: AsyncSession, user_id: int, asked_after: datetime | None = None
 ) -> CheckIn | None:
-    res = await session.execute(
+    """The most recent unanswered check-in, optionally only one asked after the
+    given moment. The cutoff stops a fresh user message from retroactively
+    "answering" a days-old check-in (that inflated answer stats)."""
+    stmt = (
         select(CheckIn)
         .where(CheckIn.user_id == user_id, CheckIn.answer.is_(None))
         .order_by(CheckIn.asked_at.desc())
         .limit(1)
     )
+    if asked_after is not None:
+        stmt = stmt.where(CheckIn.asked_at > asked_after)
+    res = await session.execute(stmt)
     return res.scalar_one_or_none()
 
 
 async def answer_checkin(session: AsyncSession, checkin: CheckIn, answer: str) -> None:
     checkin.answer = answer
     checkin.answered_at = datetime.now(timezone.utc)
+
+
+async def unanswered_checkins_after(
+    session: AsyncSession, user_id: int, after: datetime
+) -> int:
+    """How many check-ins since `after` went unanswered — the ignore streak."""
+    res = await session.execute(
+        select(func.count()).select_from(CheckIn).where(
+            CheckIn.user_id == user_id,
+            CheckIn.answer.is_(None),
+            CheckIn.asked_at > after,
+        )
+    )
+    return int(res.scalar() or 0)
+
+
+async def recent_joke_texts(
+    session: AsyncSession, user_id: int, limit: int = 30
+) -> list[str]:
+    """Last jokes the bot already sent this user (kind='joke') — to avoid repeats."""
+    res = await session.execute(
+        select(Message.content)
+        .where(
+            Message.user_id == user_id,
+            Message.kind == "joke",
+            Message.content != "",
+        )
+        .order_by(Message.created_at.desc(), Message.id.desc())
+        .limit(limit)
+    )
+    return [c for c in res.scalars().all() if c]
 
 
 # ─── Activities / Mood / Tasks ───────────────────────────────────────────────
@@ -745,6 +784,18 @@ async def add_habit(
     return habit
 
 
+async def deactivate_habit(
+    session: AsyncSession, user_id: int, title: str
+) -> str | None:
+    """Turn a habit off (active=False — a status change, never a delete), so the
+    bot stops nudging it. Returns the matched title, or None."""
+    habit = await find_habit(session, user_id, title)
+    if habit is None or not habit.active:
+        return None
+    habit.active = False
+    return habit.title
+
+
 async def log_habit(
     session: AsyncSession,
     user_id: int,
@@ -816,6 +867,104 @@ async def add_nudge(
     session.add(nudge)
     await session.flush()
     return nudge
+
+
+async def last_nudge_at(
+    session: AsyncSession, user_id: int, exclude_kinds: tuple[str, ...] = ()
+) -> datetime | None:
+    """When the bot last sent any proactive message (optionally excluding kinds).
+    Powers the silence governor's per-day / per-two-days rationing."""
+    stmt = select(func.max(Nudge.sent_at)).where(Nudge.user_id == user_id)
+    if exclude_kinds:
+        stmt = stmt.where(Nudge.kind.notin_(exclude_kinds))
+    res = await session.execute(stmt)
+    return res.scalar()
+
+
+async def nudge_sent_since(
+    session: AsyncSession, user_id: int, kind: str, since: datetime
+) -> bool:
+    res = await session.execute(
+        select(func.count()).select_from(Nudge).where(
+            Nudge.user_id == user_id,
+            Nudge.kind == kind,
+            Nudge.sent_at > since,
+        )
+    )
+    return (res.scalar() or 0) > 0
+
+
+# ─── Bot commitments (promises the bot made — they MUST fire) ─────────────────
+async def add_commitment(
+    session: AsyncSession, user_id: int, text_: str, due_at: datetime,
+    kind: str = "reminder",
+) -> BotCommitment:
+    c = BotCommitment(user_id=user_id, text=text_, due_at=due_at, kind=kind)
+    session.add(c)
+    await session.flush()
+    return c
+
+
+async def due_commitments(
+    session: AsyncSession, user_id: int, now: datetime
+) -> list[BotCommitment]:
+    res = await session.execute(
+        select(BotCommitment)
+        .where(
+            BotCommitment.user_id == user_id,
+            BotCommitment.status == "pending",
+            BotCommitment.due_at <= now,
+        )
+        .order_by(BotCommitment.due_at)
+    )
+    return list(res.scalars().all())
+
+
+async def pending_commitments(
+    session: AsyncSession, user_id: int
+) -> list[BotCommitment]:
+    res = await session.execute(
+        select(BotCommitment)
+        .where(BotCommitment.user_id == user_id, BotCommitment.status == "pending")
+        .order_by(BotCommitment.due_at)
+    )
+    return list(res.scalars().all())
+
+
+async def mark_commitment_sent(session: AsyncSession, c: BotCommitment) -> None:
+    c.status = "sent"
+    c.sent_at = datetime.now(timezone.utc)
+
+
+def _token_overlap(query: str, target: str) -> float:
+    """Share of query words found in target (prefix-tolerant for RU morphology).
+    Lets a short reference like «про свет» match «Напоминаю: выключи свет!»."""
+    q_words = [w for w in _norm(query).split() if len(w) > 2]
+    t_words = _norm(target).split()
+    if not q_words or not t_words:
+        return 0.0
+    hits = sum(
+        1 for q in q_words
+        if any(t.startswith(q) or q.startswith(t) for t in t_words if len(t) > 2)
+    )
+    return hits / len(q_words)
+
+
+async def cancel_commitment(
+    session: AsyncSession, user_id: int, text_: str
+) -> str | None:
+    """Cancel the best-matching pending commitment (status change, no delete).
+    Returns its text, or None if nothing matched."""
+    pending = await pending_commitments(session, user_id)
+    best, best_score = None, 0.0
+    for c in pending:
+        score = max(_similar(text_, c.text), _token_overlap(text_, c.text))
+        if score > best_score:
+            best, best_score = c, score
+    if best is None or best_score < 0.5:
+        return None
+    best.status = "cancelled"
+    return best.text
 
 
 # ─── Metrics (countable things + gratification numbers) ──────────────────────
@@ -1015,3 +1164,121 @@ async def nudge_sent_today(
         stmt = stmt.where(Nudge.habit_id == habit_id)
     res = await session.execute(stmt)
     return (res.scalar() or 0) > 0
+
+
+# ─── OpenAI usage / cost accounting (append-only) ─────────────────────────────
+async def record_openai_usage(session: AsyncSession, **fields) -> None:
+    """INSERT one usage row. Append-only (rows are only ever UPDATEd by the
+    price-recompute helper below; never deleted)."""
+    session.add(OpenAIUsage(**fields))
+    await session.flush()
+
+
+async def usage_grouped(
+    session: AsyncSession, *, user_id: int | None = None,
+    since: datetime | None = None, by: str = "model",
+) -> list[dict]:
+    """Aggregate usage grouped by ``model`` or ``purpose``.
+
+    ``user_id=None`` aggregates across ALL users (owner/global view).
+    """
+    col = OpenAIUsage.purpose if by == "purpose" else OpenAIUsage.model
+    stmt = select(
+        col.label("key"),
+        func.count().label("calls"),
+        func.coalesce(func.sum(OpenAIUsage.prompt_tokens), 0).label("prompt"),
+        func.coalesce(func.sum(OpenAIUsage.completion_tokens), 0).label("completion"),
+        func.coalesce(func.sum(OpenAIUsage.cached_tokens), 0).label("cached"),
+        func.coalesce(func.sum(OpenAIUsage.total_tokens), 0).label("total"),
+        func.coalesce(func.sum(OpenAIUsage.audio_seconds), 0).label("audio"),
+        func.coalesce(func.sum(OpenAIUsage.cost_usd), 0).label("cost"),
+    )
+    if user_id is not None:
+        stmt = stmt.where(OpenAIUsage.user_id == user_id)
+    if since is not None:
+        stmt = stmt.where(OpenAIUsage.created_at >= since)
+    stmt = stmt.group_by(col).order_by(func.sum(OpenAIUsage.cost_usd).desc())
+    res = await session.execute(stmt)
+    return [
+        {
+            "key": r.key, "calls": int(r.calls),
+            "prompt": int(r.prompt), "completion": int(r.completion),
+            "cached": int(r.cached), "total": int(r.total),
+            "audio": int(r.audio or 0), "cost": float(r.cost or 0),
+        }
+        for r in res
+    ]
+
+
+async def usage_total(
+    session: AsyncSession, *, user_id: int | None = None,
+    since: datetime | None = None,
+) -> dict:
+    """Grand totals (calls / tokens / USD) for the window."""
+    stmt = select(
+        func.count().label("calls"),
+        func.coalesce(func.sum(OpenAIUsage.total_tokens), 0).label("total"),
+        func.coalesce(func.sum(OpenAIUsage.cost_usd), 0).label("cost"),
+    )
+    if user_id is not None:
+        stmt = stmt.where(OpenAIUsage.user_id == user_id)
+    if since is not None:
+        stmt = stmt.where(OpenAIUsage.created_at >= since)
+    r = (await session.execute(stmt)).one()
+    return {"calls": int(r.calls), "total": int(r.total), "cost": float(r.cost or 0)}
+
+
+async def usage_by_user(
+    session: AsyncSession, *, since: datetime | None = None,
+) -> list[dict]:
+    """Owner view: per-user spend across everyone (joined to names)."""
+    stmt = (
+        select(
+            OpenAIUsage.user_id.label("uid"),
+            User.first_name.label("name"),
+            User.username.label("username"),
+            func.count().label("calls"),
+            func.coalesce(func.sum(OpenAIUsage.cost_usd), 0).label("cost"),
+            func.coalesce(func.sum(OpenAIUsage.total_tokens), 0).label("total"),
+        )
+        .join(User, User.id == OpenAIUsage.user_id, isouter=True)
+    )
+    if since is not None:
+        stmt = stmt.where(OpenAIUsage.created_at >= since)
+    stmt = stmt.group_by(
+        OpenAIUsage.user_id, User.first_name, User.username
+    ).order_by(func.sum(OpenAIUsage.cost_usd).desc())
+    res = await session.execute(stmt)
+    return [
+        {"uid": r.uid, "name": r.name, "username": r.username,
+         "calls": int(r.calls), "cost": float(r.cost or 0), "total": int(r.total)}
+        for r in res
+    ]
+
+
+async def recompute_openai_costs(session: AsyncSession) -> int:
+    """Recompute ``cost_usd`` for rows priced under an old price_version, using
+    the stored tokens/seconds against the CURRENT price table. UPDATE only — no
+    deletes (honours the project's no-delete rule). Returns rows touched.
+    """
+    from app import pricing  # local import: pricing has no deps on this module
+
+    res = await session.execute(
+        select(OpenAIUsage).where(
+            (OpenAIUsage.price_version != pricing.PRICE_VERSION)
+            | (OpenAIUsage.price_version.is_(None))
+        )
+    )
+    n = 0
+    for row in res.scalars():
+        if row.api == "transcription":
+            cost, ver = pricing.audio_cost_usd(row.model, row.audio_seconds)
+        else:
+            cost, ver = pricing.chat_cost_usd(
+                row.model, row.prompt_tokens, row.cached_tokens, row.completion_tokens
+            )
+        row.cost_usd = cost
+        row.price_version = ver
+        n += 1
+    await session.flush()
+    return n

@@ -7,7 +7,7 @@ Every tool is additive or a status change — none deletes data.
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app import repository as repo
@@ -391,6 +391,66 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "remind_once",
+            "description": "Записать РАЗОВОЕ напоминание/обещание вернуться к теме — оно "
+            "РЕАЛЬНО сработает в указанное время. ОБЯЗАТЕЛЬНОЕ правило: любое твоё "
+            "обещание «напомню», «напишу позже», «вернусь к этому», «спрошу вечером» "
+            "ДОЛЖНО сопровождаться вызовом этого инструмента — обещание без вызова "
+            "означает, что напоминание НЕ придёт и ты обманешь человека. Укажи либо "
+            "in_minutes (через сколько минут), либо time (HH:MM, местное; если уже "
+            "прошло — завтра), при желании с date (YYYY-MM-DD). В text пиши готовую "
+            "реплику-напоминание от своего лица.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "что написать человеку, когда время придёт",
+                    },
+                    "in_minutes": {
+                        "type": "integer",
+                        "description": "через сколько минут (например, 20)",
+                    },
+                    "time": {"type": "string", "description": "HH:MM, местное время"},
+                    "date": {"type": "string", "description": "YYYY-MM-DD, необязательно"},
+                },
+                "required": ["text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cancel_reminder",
+            "description": "Отменить ранее поставленное разовое напоминание, когда человек "
+            "говорит, что оно больше не нужно («не надо напоминать про X»).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "про что было напоминание"},
+                },
+                "required": ["text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "deactivate_habit",
+            "description": "Выключить привычку (перестать напоминать), когда человек просит "
+            "убрать/отменить её («убери медитацию», «больше не напоминай про чтение», "
+            "«эта привычка не актуальна»). ОБЯЗАТЕЛЬНО вызови, прежде чем говорить, что "
+            "убрал привычку. Это выключение, история сохраняется.",
+            "parameters": {
+                "type": "object",
+                "properties": {"title": {"type": "string"}},
+                "required": ["title"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "reflect",
             "description": "Запустить разбор недели (само-анализ), когда человек просит "
             "подумать/проанализировать/подвести итоги недели: «вызови рефлексию», "
@@ -731,6 +791,57 @@ async def run_tool(user_id: int, name: str, args: dict) -> str:
                 await s.commit()
                 bits = [b for b in [outcome, f"энергия {energy}/5" if energy else None] if b]
                 return "ок: разбор дня записан" + (f" ({', '.join(bits)})" if bits else "")
+
+            if name == "remind_once":
+                text = (args.get("text") or "").strip()
+                if not text:
+                    return "ошибка: нужен текст напоминания"
+                try:
+                    tz = ZoneInfo(user.timezone)
+                except Exception:  # noqa: BLE001
+                    tz = ZoneInfo("UTC")
+                now_local = datetime.now(tz)
+                due_local = None
+                mins = args.get("in_minutes")
+                if isinstance(mins, int) and mins > 0:
+                    due_local = now_local + timedelta(minutes=mins)
+                else:
+                    t = _valid_hhmm(args.get("time", "")) if args.get("time") else None
+                    d = _valid_date(args.get("date", "")) if args.get("date") else None
+                    if t is None and d is None:
+                        return ("ошибка: укажи in_minutes ИЛИ time (HH:MM), "
+                                "иначе я не знаю, когда напомнить")
+                    hh, mm = (int(x) for x in (t or "09:00").split(":"))
+                    day = d or now_local.date()
+                    due_local = datetime(day.year, day.month, day.day, hh, mm, tzinfo=tz)
+                    # "напомни в 18:30" after 18:30 means tomorrow, not the past.
+                    if d is None and due_local <= now_local:
+                        due_local += timedelta(days=1)
+                if due_local <= now_local - timedelta(minutes=1):
+                    return "ошибка: это время уже прошло"
+                due_utc = due_local.astimezone(ZoneInfo("UTC"))
+                await repo.add_commitment(s, user_id, text, due_utc)
+                await s.commit()
+                return (f"ок: напоминание поставлено на "
+                        f"{due_local.strftime('%d.%m %H:%M')} (местное) — придёт")
+
+            if name == "cancel_reminder":
+                text = (args.get("text") or "").strip()
+                if not text:
+                    return "ошибка: скажи, какое напоминание отменить"
+                cancelled = await repo.cancel_commitment(s, user_id, text)
+                await s.commit()
+                return (f"ок: напоминание «{cancelled}» отменено" if cancelled
+                        else "не нашёл такого активного напоминания")
+
+            if name == "deactivate_habit":
+                title = (args.get("title") or "").strip()
+                if not title:
+                    return "ошибка: нужно название привычки"
+                matched = await repo.deactivate_habit(s, user_id, title)
+                await s.commit()
+                return (f"ок: привычка «{matched}» выключена — больше не напоминаю"
+                        if matched else f"не нашёл активную привычку «{title}»")
 
             if name == "record_mood":
                 score = args.get("score")
