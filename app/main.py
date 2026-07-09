@@ -6,6 +6,7 @@ import logging
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
+from aiogram.types import BotCommand
 
 from app.bot.handlers import router
 from app.config import get_settings
@@ -45,6 +46,28 @@ async def run() -> None:
     )
     dp = Dispatcher()
     dp.include_router(router)
+
+    await bot.set_my_commands([
+        BotCommand(command="plan", description="план на день"),
+        BotCommand(command="done", description="отметить сделанное"),
+        BotCommand(command="dashboard", description="карточка дня (картинка)"),
+        BotCommand(command="status", description="сводка за сегодня"),
+        BotCommand(command="goals", description="цели и вехи"),
+        BotCommand(command="habits", description="привычки"),
+        BotCommand(command="streak", description="серии привычек"),
+        BotCommand(command="report", description="отчёт за неделю"),
+        BotCommand(command="mood", description="отметить настроение"),
+        BotCommand(command="reflect", description="разбор недели"),
+        BotCommand(command="profile", description="что я о тебе знаю"),
+        BotCommand(command="rhythm", description="мой ритм активности"),
+        BotCommand(command="calendar", description="отсчёт до цели"),
+        BotCommand(command="interval", description="частота проверок (мин)"),
+        BotCommand(command="tz", description="часовой пояс"),
+        BotCommand(command="pause", description="пауза напоминаний"),
+        BotCommand(command="resume", description="включить напоминания"),
+        BotCommand(command="cost", description="расходы на OpenAI"),
+        BotCommand(command="help", description="помощь"),
+    ])
 
     scheduler = build_scheduler(bot, settings.timezone)
     scheduler.start()
